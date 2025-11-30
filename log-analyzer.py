@@ -341,7 +341,11 @@ class ApacheLogAnalyzer:
             'indicators': indicators,
             'requests': total,
             'status_codes': dict(activity['status_codes']),
-            'binary_count': binary_count
+            'binary_count': binary_count,
+            'success_count': success,
+            'error_count': errors,
+            'unique_endpoints': len(activity['endpoints']),
+            'classification_numeric': 3 if cls == "BOT-HIGH" else 2 if cls == "BOT-MED" else 1 if cls == "SUSPICIOUS" else 0
         }
 
 def main():
@@ -350,6 +354,14 @@ def main():
     parser.add_argument('--format', choices=['standard', 'combined', 'poophole'], default='combined')
     parser.add_argument('--min-req', type=int, default=1, help='Minimum requests')
     parser.add_argument('--output', choices=['summary', 'detailed'], default='summary')
+    
+    # NEW: Sorting and filtering options
+    parser.add_argument('--sort-by', choices=['ip', 'type', 'requests', 'score', 'errors', 'success', 'endpoints'], 
+                       default='requests', help='Field to sort by')
+    parser.add_argument('--sort-order', choices=['asc', 'desc'], default='desc', help='Sort order')
+    parser.add_argument('--filter-type', choices=['all', 'bot-high', 'bot-med', 'suspicious', 'human'], 
+                       default='all', help='Filter by classification')
+    parser.add_argument('--min-score', type=int, default=0, help='Minimum bot score to include')
     
     args = parser.parse_args()
     
@@ -364,15 +376,58 @@ def main():
         total = len(analyzer.ip_activity[ip]['requests'])
         if total >= args.min_req:
             cls, details = analyzer.analyze_ip(ip)
-            results.append((ip, cls, details, total))
+            
+            # NEW: Apply filters
+            if args.filter_type != 'all':
+                if args.filter_type == 'bot-high' and cls != 'BOT-HIGH':
+                    continue
+                elif args.filter_type == 'bot-med' and cls not in ['BOT-HIGH', 'BOT-MED']:
+                    continue
+                elif args.filter_type == 'suspicious' and cls not in ['BOT-HIGH', 'BOT-MED', 'SUSPICIOUS']:
+                    continue
+                elif args.filter_type == 'human' and cls != 'HUMAN':
+                    continue
+            
+            if details['score'] < args.min_score:
+                continue
+                
+            results.append({
+                'ip': ip,
+                'classification': cls,
+                'details': details,
+                'total_requests': total
+            })
     
-    results.sort(key=lambda x: x[3], reverse=True)
+    # NEW: Sorting logic
+    sort_field = args.sort_by
+    reverse_order = (args.sort_order == 'desc')
     
-    print(f"\n{'IP':<20} {'Type':<12} {'Requests':<10} Score")
-    print('-' * 60)
+    if sort_field == 'ip':
+        results.sort(key=lambda x: x['ip'], reverse=reverse_order)
+    elif sort_field == 'type':
+        results.sort(key=lambda x: x['details']['classification_numeric'], reverse=reverse_order)
+    elif sort_field == 'requests':
+        results.sort(key=lambda x: x['total_requests'], reverse=reverse_order)
+    elif sort_field == 'score':
+        results.sort(key=lambda x: x['details']['score'], reverse=reverse_order)
+    elif sort_field == 'errors':
+        results.sort(key=lambda x: x['details']['error_count'], reverse=reverse_order)
+    elif sort_field == 'success':
+        results.sort(key=lambda x: x['details']['success_count'], reverse=reverse_order)
+    elif sort_field == 'endpoints':
+        results.sort(key=lambda x: x['details']['unique_endpoints'], reverse=reverse_order)
     
-    for ip, cls, details, total in results:
-        print(f"{ip:<20} {cls:<12} {total:<10} {details['score']}")
+    print(f"\nResults (sorted by {args.sort_by}, {args.sort_order}):")
+    print(f"{'IP':<20} {'Type':<12} {'Requests':<10} {'Score':<6} {'Errors':<8} {'Success':<8} {'Endpoints':<10}")
+    print('-' * 80)
+    
+    for result in results:
+        ip = result['ip']
+        cls = result['classification']
+        details = result['details']
+        total = result['total_requests']
+        
+        print(f"{ip:<20} {cls:<12} {total:<10} {details['score']:<6} {details['error_count']:<8} {details['success_count']:<8} {details['unique_endpoints']:<10}")
         
         if args.output == 'detailed' and details['indicators']:
             for ind in details['indicators']:
