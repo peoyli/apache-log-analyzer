@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Apache Log Analyzer - Distinguishes between real users and bots
-Supports: standard, combined, and poophole log formats
+Clean version without problematic escape sequences
 """
 
 import re
@@ -9,7 +9,6 @@ import sys
 import argparse
 from collections import defaultdict, Counter
 from datetime import datetime
-import ipaddress
 
 class ApacheLogAnalyzer:
     def __init__(self):
@@ -22,86 +21,99 @@ class ApacheLogAnalyzer:
             'last_seen': None
         })
         
-        # Bot indicators
+        # Bot indicators - using raw strings for patterns
         self.bot_indicators = {
             'suspicious_user_agents': [
-                r'bot', r'crawler', r'spider', r'scanner', r'nmap', r'sqlmap',
-                r'nikto', r'wget', r'curl', r'python', r'java', r'go-http-client',
-                r'zgrab', r'masscan', r'nessus', r'metasploit', r'acunetix',
-                r'burp', r'dirbuster', r'gobuster', r'arachni', r'openvas'
+                'bot', 'crawler', 'spider', 'scanner', 'nmap', 'sqlmap',
+                'nikto', 'wget', 'curl', 'python', 'java', 'go-http-client',
+                'zgrab', 'masscan', 'nessus', 'metasploit', 'acunetix',
+                'burp', 'dirbuster', 'gobuster', 'arachni', 'openvas'
             ],
             'suspicious_paths': [
                 r'/(admin|administrator|phpmyadmin|mysql|wp-admin|\.git|\.env|backup)',
                 r'\.(php|asp|jsp|py|sh|pl)(\.|$)',
                 r'(union|select|insert|update|delete|drop|exec)',
                 r'(etc/passwd|proc/self|\.\./\.\./)'
-            ],
-            'suspicious_status_patterns': [
-                (404, 10),  # More than 10 404s
-                (403, 5),   # More than 5 403s  
-                (500, 3),   # More than 3 500s
             ]
         }
     
     def parse_line(self, line, log_format):
-        """Parse a log line based on the specified format"""
+        """Parse a log line"""
         try:
             if log_format == 'combined':
                 return self.parse_combined(line)
             elif log_format == 'poophole':
                 return self.parse_poophole(line)
-            else:  # standard
+            else:
                 return self.parse_standard(line)
-        except Exception as e:
+        except Exception:
+            return self.parse_fallback(line)
+    
+    def parse_fallback(self, line):
+        """Fallback parser for problematic lines"""
+        try:
+            # Extract basic fields using simple parsing
+            parts = line.split()
+            if len(parts) < 7:
+                return None
+            
+            ip = parts[0]
+            
+            # Find timestamp between brackets
+            timestamp_match = re.search(r'\[([^\]]+)\]', line)
+            timestamp = timestamp_match.group(1) if timestamp_match else ''
+            
+            # Find status code
+            status = 400
+            for part in parts:
+                if part.isdigit() and len(part) == 3:
+                    status = int(part)
+                    break
+            
+            # Extract request between quotes
+            request_match = re.search(r'"([^"]*)"', line)
+            request = request_match.group(1) if request_match else 'UNKNOWN'
+            
+            # Check for binary patterns
+            method = 'BINARY' if '\\x' in request else 'UNKNOWN'
+            
+            # Extract user agent
+            quotes = re.findall(r'"([^"]*)"', line)
+            user_agent = quotes[-1] if quotes else ''
+            referer = quotes[-2] if len(quotes) >= 2 else ''
+            
+            return {
+                'ip': ip,
+                'timestamp': timestamp,
+                'method': method,
+                'path': request,
+                'protocol': 'UNKNOWN',
+                'status': status,
+                'size': '0',
+                'referer': referer,
+                'user_agent': user_agent,
+                'malformed': True
+            }
+        except:
             return None
     
-    def parse_standard(self, line):
-        """Parse standard Apache log format"""
-        # Standard: %h %l %u %t \"%r\" %>s %b
-        pattern = r'^(\S+) \S+ \S+ \[([^\]]+)\] "(\S+) ([^"]+) (\S+)" (\d+) (\S+)'
-        match = re.match(pattern, line)
-        if match:
-            ip, timestamp, method, path, protocol, status, size = match.groups()
-            return {
-                'ip': ip,
-                'timestamp': timestamp,
-                'method': method,
-                'path': path,
-                'protocol': protocol,
-                'status': int(status),
-                'size': size if size != '-' else '0',
-                'user_agent': '',
-                'referer': ''
-            }
-        return None
-    
     def parse_combined(self, line):
-        """Parse combined Apache log format"""
-        # Combined: %h %l %u %t \"%r\" %>s %b \"%{Referer}i\" \"%{User-Agent}i\"
-        pattern = r'^(\S+) \S+ \S+ \[([^\]]+)\] "(\S+) ([^"]+) (\S+)" (\d+) (\S+) "([^"]*)" "([^"]*)"'
+        """Parse combined log format"""
+        # Flexible pattern for combined format
+        pattern = r'^(\S+)\s+\S+\s+\S+\s+\[([^\]]+)\]\s+"([^"]*)"\s+(\d+)\s+(\S+)\s+"([^"]*)"\s+"([^"]*)"'
         match = re.match(pattern, line)
+        
         if match:
-            ip, timestamp, method, path, protocol, status, size, referer, user_agent = match.groups()
-            return {
-                'ip': ip,
-                'timestamp': timestamp,
-                'method': method,
-                'path': path,
-                'protocol': protocol,
-                'status': int(status),
-                'size': size if size != '-' else '0',
-                'referer': referer,
-                'user_agent': user_agent
-            }
-        return None
-    
-    def parse_poophole(self, line):
-        """Parse poophole custom log format"""
-        # poophole: "%t %h %A:%p %v \"%r\" %>s %b \"%{Referer}i\" \"%{User-Agent}i\" %{Host}i"
-        pattern = r'^\[([^\]]+)\] (\S+) \S+:\d+ \S+ "(\S+) ([^"]+) (\S+)" (\d+) (\S+) "([^"]*)" "([^"]*)" (\S+)'
-        match = re.match(pattern, line)
-        if match:
-            timestamp, ip, method, path, protocol, status, size, referer, user_agent, host = match.groups()
+            ip, timestamp, request, status, size, referer, user_agent = match.groups()
+            
+            # Handle binary requests
+            if '\\x' in request:
+                method = 'BINARY'
+                path = request
+                protocol = 'UNKNOWN'
+            else:
+                method, path, protocol = self.parse_http_request(request)
+            
             return {
                 'ip': ip,
                 'timestamp': timestamp,
@@ -112,206 +124,261 @@ class ApacheLogAnalyzer:
                 'size': size if size != '-' else '0',
                 'referer': referer,
                 'user_agent': user_agent,
-                'host': host
+                'malformed': False
             }
-        return None
+        
+        return self.parse_fallback(line)
+    
+    def parse_standard(self, line):
+        """Parse standard log format"""
+        pattern = r'^(\S+)\s+\S+\s+\S+\s+\[([^\]]+)\]\s+"([^"]*)"\s+(\d+)\s+(\S+)'
+        match = re.match(pattern, line)
+        
+        if match:
+            ip, timestamp, request, status, size = match.groups()
+            
+            if '\\x' in request:
+                method = 'BINARY'
+                path = request
+                protocol = 'UNKNOWN'
+            else:
+                method, path, protocol = self.parse_http_request(request)
+            
+            return {
+                'ip': ip,
+                'timestamp': timestamp,
+                'method': method,
+                'path': path,
+                'protocol': protocol,
+                'status': int(status),
+                'size': size if size != '-' else '0',
+                'referer': '',
+                'user_agent': '',
+                'malformed': False
+            }
+        
+        return self.parse_fallback(line)
+    
+    def parse_poophole(self, line):
+        """Parse poophole custom format"""
+        pattern = r'^\[([^\]]+)\]\s+(\S+)\s+\S+:\d+\s+\S+\s+"([^"]*)"\s+(\d+)\s+(\S+)\s+"([^"]*)"\s+"([^"]*)"\s+(\S+)'
+        match = re.match(pattern, line)
+        
+        if match:
+            timestamp, ip, request, status, size, referer, user_agent, host = match.groups()
+            
+            if '\\x' in request:
+                method = 'BINARY'
+                path = request
+                protocol = 'UNKNOWN'
+            else:
+                method, path, protocol = self.parse_http_request(request)
+            
+            return {
+                'ip': ip,
+                'timestamp': timestamp,
+                'method': method,
+                'path': path,
+                'protocol': protocol,
+                'status': int(status),
+                'size': size if size != '-' else '0',
+                'referer': referer,
+                'user_agent': user_agent,
+                'host': host,
+                'malformed': False
+            }
+        
+        return self.parse_fallback(line)
+    
+    def parse_http_request(self, request):
+        """Parse normal HTTP request line"""
+        if not request or request == '-':
+            return 'UNKNOWN', '/', 'HTTP/1.0'
+        
+        parts = request.split(' ', 2)
+        if len(parts) >= 3:
+            return parts[0], parts[1], parts[2]
+        elif len(parts) == 2:
+            return parts[0], parts[1], 'HTTP/1.0'
+        elif len(parts) == 1:
+            return parts[0], '/', 'HTTP/1.0'
+        else:
+            return 'MALFORMED', request, 'UNKNOWN'
     
     def process_log_file(self, filename, log_format='combined'):
-        """Process a log file and extract IP activity"""
+        """Process the log file"""
         try:
-            with open(filename, 'r') as f:
+            with open(filename, 'r', encoding='utf-8', errors='ignore') as f:
+                parsed = 0
+                errors = 0
+                
                 for line_num, line in enumerate(f, 1):
                     line = line.strip()
                     if not line:
                         continue
                     
-                    log_entry = self.parse_line(line, log_format)
-                    if log_entry:
-                        self.update_ip_activity(log_entry)
+                    entry = self.parse_line(line, log_format)
+                    if entry:
+                        self.update_ip_activity(entry)
+                        parsed += 1
                     else:
-                        print(f"Warning: Could not parse line {line_num}: {line[:100]}...")
-        
-        except FileNotFoundError:
-            print(f"Error: File {filename} not found")
-            return False
+                        errors += 1
+                        if errors <= 5:
+                            print(f"Parse error line {line_num}: {line[:80]}...")
+                
+                print(f"Parsed: {parsed}, Errors: {errors}")
+                return True
+                
         except Exception as e:
-            print(f"Error reading file {filename}: {e}")
+            print(f"Error: {e}")
             return False
-        
-        return True
     
-    def update_ip_activity(self, log_entry):
-        """Update activity tracking for an IP address"""
-        ip = log_entry['ip']
+    def update_ip_activity(self, entry):
+        """Update activity for an IP"""
+        ip = entry['ip']
         activity = self.ip_activity[ip]
         
         # Parse timestamp
         try:
-            # Handle different timestamp formats
-            timestamp_str = log_entry['timestamp']
-            if ':' in timestamp_str.split()[0]:
-                # Format: [day/month/year:hour:minute:second zone]
-                timestamp_str = timestamp_str.replace(':', ' ', 1)
-                dt = datetime.strptime(timestamp_str, '%d/%b/%Y %H:%M:%S %z')
-            else:
-                dt = datetime.strptime(timestamp_str, '%a %b %d %H:%M:%S %Y')
-            
-            if activity['first_seen'] is None or dt < activity['first_seen']:
-                activity['first_seen'] = dt
-            if activity['last_seen'] is None or dt > activity['last_seen']:
-                activity['last_seen'] = dt
+            ts = entry['timestamp']
+            if ts:
+                if ':' in ts.split()[0]:
+                    ts = ts.replace(':', ' ', 1)
+                    dt = datetime.strptime(ts, '%d/%b/%Y %H:%M:%S %z')
+                else:
+                    dt = datetime.strptime(ts, '%a %b %d %H:%M:%S %Y')
+                
+                if not activity['first_seen'] or dt < activity['first_seen']:
+                    activity['first_seen'] = dt
+                if not activity['last_seen'] or dt > activity['last_seen']:
+                    activity['last_seen'] = dt
         except:
             pass
         
-        # Update counters
-        activity['status_codes'][log_entry['status']] += 1
-        activity['user_agents'][log_entry.get('user_agent', '')] += 1
-        activity['endpoints'][log_entry['path']] += 1
-        activity['requests'].append(log_entry)
+        activity['status_codes'][entry['status']] += 1
+        activity['user_agents'][entry.get('user_agent', '')] += 1
+        activity['endpoints'][entry['path']] += 1
+        activity['requests'].append(entry)
     
     def analyze_ip(self, ip):
-        """Analyze IP behavior and determine if it's a bot"""
+        """Analyze IP behavior"""
         activity = self.ip_activity[ip]
-        total_requests = len(activity['requests'])
+        total = len(activity['requests'])
         
-        if total_requests == 0:
-            return 'unknown', {}
+        if total == 0:
+            return 'UNKNOWN', {}
         
-        bot_score = 0
+        score = 0
         indicators = []
         
-        # 1. Check user agent patterns
-        user_agent = max(activity['user_agents'].items(), key=lambda x: x[1])[0] if activity['user_agents'] else ''
-        if user_agent:
+        # Binary requests are highly suspicious
+        binary_count = sum(1 for r in activity['requests'] if r['method'] == 'BINARY' or r.get('malformed'))
+        if binary_count > 0:
+            score += 5
+            indicators.append(f"Binary requests: {binary_count}")
+        
+        # User agent analysis
+        ua = max(activity['user_agents'].items(), key=lambda x: x[1])[0] if activity['user_agents'] else ''
+        if ua:
             for pattern in self.bot_indicators['suspicious_user_agents']:
-                if re.search(pattern, user_agent, re.IGNORECASE):
-                    bot_score += 3
-                    indicators.append(f"Suspicious User-Agent: {user_agent}")
+                if pattern.lower() in ua.lower():
+                    score += 3
+                    indicators.append(f"Bot-like UA: {ua[:40]}...")
                     break
         
-        # 2. Check status code patterns
-        for status, threshold in self.bot_indicators['suspicious_status_patterns']:
-            if activity['status_codes'][status] > threshold:
-                bot_score += 2
-                indicators.append(f"Excessive {status} errors: {activity['status_codes'][status]}")
+        # Status code patterns
+        if activity['status_codes'][404] > 10:
+            score += 2
+            indicators.append(f"Many 404s: {activity['status_codes'][404]}")
         
-        # 3. Check for scanning patterns (many 404s relative to success)
-        success_codes = activity['status_codes'][200] + activity['status_codes'][301] + activity['status_codes'][302]
-        error_codes = activity['status_codes'][404] + activity['status_codes'][403]
+        if activity['status_codes'][403] > 5:
+            score += 2
+            indicators.append(f"Many 403s: {activity['status_codes'][403]}")
         
-        if error_codes > 0 and success_codes == 0:
-            bot_score += 4
-            indicators.append("All requests resulted in errors")
-        elif error_codes > success_codes * 2 and error_codes > 5:
-            bot_score += 3
-            indicators.append("High error-to-success ratio")
+        # Error ratio
+        success = activity['status_codes'][200] + activity['status_codes'][301] + activity['status_codes'][302]
+        errors = activity['status_codes'][404] + activity['status_codes'][403] + activity['status_codes'][500]
         
-        # 4. Check request rate (very high frequency)
+        if errors > 0 and success == 0:
+            score += 3
+            indicators.append("No successful requests")
+        elif errors > success * 2 and errors > 5:
+            score += 2
+            indicators.append("High error rate")
+        
+        # Request frequency
         if activity['first_seen'] and activity['last_seen']:
-            time_diff = (activity['last_seen'] - activity['first_seen']).total_seconds()
-            if time_diff > 0:
-                requests_per_second = total_requests / time_diff
-                if requests_per_second > 2:  # More than 2 requests per second
-                    bot_score += 3
-                    indicators.append(f"High request rate: {requests_per_second:.2f} req/sec")
+            secs = (activity['last_seen'] - activity['first_seen']).total_seconds()
+            if secs > 0 and total / secs > 2:
+                score += 2
+                indicators.append("High frequency")
         
-        # 5. Check for suspicious paths
-        for endpoint in activity['endpoints']:
+        # Path analysis
+        for path in activity['endpoints']:
+            if '\\x' in path:
+                score += 3
+                indicators.append("Binary data in paths")
+                break
+            
             for pattern in self.bot_indicators['suspicious_paths']:
-                if re.search(pattern, endpoint, re.IGNORECASE):
-                    bot_score += 2
-                    indicators.append(f"Suspicious path: {endpoint}")
+                if re.search(pattern, path, re.IGNORECASE):
+                    score += 2
+                    indicators.append(f"Suspicious path: {path[:40]}...")
                     break
         
-        # 6. Check for single endpoint scanning
-        if len(activity['endpoints']) > 20 and total_requests > 50:
-            unique_endpoint_ratio = len(activity['endpoints']) / total_requests
-            if unique_endpoint_ratio > 0.8:  # Mostly unique requests
-                bot_score += 2
-                indicators.append("Scanning pattern: many unique endpoints")
-        
-        # Determine classification
-        if bot_score >= 8:
-            classification = "BOT - High confidence"
-        elif bot_score >= 5:
-            classification = "BOT - Medium confidence"
-        elif bot_score >= 3:
-            classification = "SUSPICIOUS - Possible bot"
+        # Classification
+        if score >= 8:
+            cls = "BOT-HIGH"
+        elif score >= 5:
+            cls = "BOT-MED"
+        elif score >= 3:
+            cls = "SUSPICIOUS"
         else:
-            classification = "HUMAN - Likely legitimate"
+            cls = "HUMAN"
         
-        return classification, {
-            'bot_score': bot_score,
+        return cls, {
+            'score': score,
             'indicators': indicators,
-            'total_requests': total_requests,
+            'requests': total,
             'status_codes': dict(activity['status_codes']),
-            'unique_endpoints': len(activity['endpoints']),
-            'time_range': activity['last_seen'] - activity['first_seen'] if activity['first_seen'] and activity['last_seen'] else None
+            'binary_count': binary_count
         }
 
 def main():
-    parser = argparse.ArgumentParser(description='Analyze Apache logs to distinguish bots from humans')
-    parser.add_argument('logfile', help='Apache log file to analyze')
-    parser.add_argument('--format', choices=['standard', 'combined', 'poophole'], 
-                       default='combined', help='Log format (default: combined)')
-    parser.add_argument('--min-requests', type=int, default=1,
-                       help='Minimum requests to consider (default: 1)')
-    parser.add_argument('--output', choices=['summary', 'detailed'], default='summary',
-                       help='Output format')
+    parser = argparse.ArgumentParser(description='Apache log analyzer')
+    parser.add_argument('logfile', help='Log file path')
+    parser.add_argument('--format', choices=['standard', 'combined', 'poophole'], default='combined')
+    parser.add_argument('--min-req', type=int, default=1, help='Minimum requests')
+    parser.add_argument('--output', choices=['summary', 'detailed'], default='summary')
     
     args = parser.parse_args()
     
     analyzer = ApacheLogAnalyzer()
-    
-    print(f"Analyzing {args.logfile} with {args.format} format...")
+    print(f"Analyzing {args.logfile}...")
     
     if not analyzer.process_log_file(args.logfile, args.format):
         sys.exit(1)
     
-    print(f"\nAnalysis completed. Found {len(analyzer.ip_activity)} unique IP addresses.")
-    
-    # Analyze each IP
     results = []
     for ip in analyzer.ip_activity:
-        activity = analyzer.ip_activity[ip]
-        total_requests = len(activity['requests'])
+        total = len(analyzer.ip_activity[ip]['requests'])
+        if total >= args.min_req:
+            cls, details = analyzer.analyze_ip(ip)
+            results.append((ip, cls, details, total))
+    
+    results.sort(key=lambda x: x[3], reverse=True)
+    
+    print(f"\n{'IP':<20} {'Type':<12} {'Requests':<10} Score")
+    print('-' * 60)
+    
+    for ip, cls, details, total in results:
+        print(f"{ip:<20} {cls:<12} {total:<10} {details['score']}")
         
-        if total_requests >= args.min_requests:
-            classification, details = analyzer.analyze_ip(ip)
-            results.append({
-                'ip': ip,
-                'classification': classification,
-                'details': details,
-                'total_requests': total_requests
-            })
-    
-    # Sort by total requests (descending)
-    results.sort(key=lambda x: x['total_requests'], reverse=True)
-    
-    # Print results
-    print(f"\n{'IP Address':<20} {'Classification':<30} {'Requests':<10} {'Bot Score':<10}")
-    print("-" * 80)
-    
-    for result in results:
-        print(f"{result['ip']:<20} {result['classification']:<30} {result['total_requests']:<10} {result['details']['bot_score']:<10}")
-        
-        if args.output == 'detailed' and result['details']['indicators']:
-            print("  Indicators:")
-            for indicator in result['details']['indicators']:
-                print(f"    - {indicator}")
-            print("  Status Codes:", result['details']['status_codes'])
-            if result['details']['time_range']:
-                print(f"  Time Range: {result['details']['time_range']}")
+        if args.output == 'detailed' and details['indicators']:
+            for ind in details['indicators']:
+                print(f"   {ind}")
+            print(f"   Status: {details['status_codes']}")
             print()
-    
-    # Summary statistics
-    classifications = Counter([r['classification'] for r in results])
-    print(f"\nSummary Statistics:")
-    for classification, count in classifications.items():
-        print(f"  {classification}: {count} IPs")
-    
-    total_analyzed = sum(r['total_requests'] for r in results)
-    print(f"Total requests analyzed: {total_analyzed}")
 
 if __name__ == "__main__":
     main()
